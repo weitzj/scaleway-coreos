@@ -1,0 +1,232 @@
+#cloud-config
+
+coreos:
+  units:
+    - name: scw-signal-boot.service
+      enable: true
+      command: start
+      content: |
+        [Unit]
+        Description=Signals a successfull boot to Scaleways monitor
+        After=network-online.target systemd-networkd-wait-online.service
+        Requires=network-online.target systemd-networkd-wait-online.service
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=true
+        ExecStart=/bin/curl \
+          --fail --silent --show-error --location \
+          --connect-timeout 1 --max-time 5 \
+          -X PATCH -H 'Content-Type: application/json' \
+          http://169.254.42.42/state \
+          -d '{"state_detail": "booted"}'
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: scw-set-environment-file.service
+      command: start
+      content: |
+        [Unit]
+        Description=Converts Scaleways metadata to /etc/environment
+        After=network-online.target systemd-networkd-wait-online.service
+        Requires=network-online.target systemd-networkd-wait-online.service
+
+        [Service]
+        Type=oneshot
+        Environment=PATH=/opt/sbin:/opt/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        ExecStart=/usr/bin/bash -c "\
+          /usr/local/bin/scw-metadata | \
+          grep -F -e 'PUBLIC_IP_ADDRESS' -e 'IPV6' -e 'PRIVATE_IP' -e 'HOSTNAME' | \
+          sed -e 's/^HOSTNAME/SCW_HOSTNAME/;s/^PUBLIC_IP_ADDRESS/COREOS_PUBLIC_IPV4/;s/^PRIVATE_IP/COREOS_PRIVATE_IPV4/;s/^IPV6/COREOS_PUBLIC_IPV6/' | \
+          sort >/etc/environment"
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: scw-set-hostname.service
+      command: start
+      content: |
+        [Unit]
+        Description=Sets the hostname according to /etc/environment
+        After=scw-set-environment-file.service
+        Requires=scw-set-environment-file.service
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=true
+        EnvironmentFile=/etc/environment
+        ExecStart=/usr/bin/hostnamectl set-hostname "$SCW_HOSTNAME"
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: scw-set-ssh-keys.service
+      command: start
+      content: |
+        [Unit]
+        Description=Installs Scaleways metadata ssh keys for root user
+        After=network-online.target systemd-networkd-wait-online.service
+        Requires=network-online.target systemd-networkd-wait-online.service
+
+        [Service]
+        Type=oneshot
+        Environment=PATH=/opt/sbin:/opt/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        ExecStart=/usr/bin/bash -c "/usr/local/bin/scw-fetch-ssh-keys"
+
+        [Install]
+        WantedBy=multi-user.target
+  update:
+    reboot-strategy: off
+
+write_files:
+  - path: /usr/local/bin/scw-metadata
+    permissions: 0755
+    owner: root:root
+    content: |
+      #!/bin/sh
+      # description "executable which retrieves server metadata (TEXT)"
+      # author "Scaleway <opensource@scaleway.com>"
+
+      export PATH="${PATH:+$PATH:}/usr/bin:/bin"
+
+      CACHE_FILE=/run/scw-metadata.cache
+      METADATA_IP=${METADATA_IP:-169.254.42.42}
+      METADATA_URL=${METADATA_URL:-"http://${METADATA_IP}/conf"}
+
+      if [ "$1" = "--cached" -a -f $CACHE_FILE ]; then
+          shift
+          BODY=$(cat $CACHE_FILE)
+      else
+          [ "$1" = "--cached" ] && shift
+          if hash curl 2>/dev/null; then
+              # Using curl
+              CODE=0
+              while [ $CODE -ne 200 ]; do
+                  RESPONSE=$(curl --noproxy '*' --silent --write-out "\n%{http_CODE}\n" $METADATA_URL)
+                  CODE=$(echo "$RESPONSE" | sed -n '$p')
+                  BODY=$(echo "$RESPONSE" | sed '$d')
+
+                  if [ $CODE -eq 200 ]; then
+                      echo "$BODY" > /run/scw-metadata.cache
+                      ln -s scw-metadata.cache /run/oc-metadata.cache 2>/dev/null
+                      break
+                  fi
+                  sleep 5
+              done
+          else
+              # Using wget
+              for i in 1 2 3 4 5; do
+                  BODY=$(wget --no-proxy --quiet -O- $METADATA_URL)
+                  echo "$BODY" | grep PRIVATE_IP >/dev/null
+                  if [ $? -eq 0 ]; then
+                      echo "$BODY" > /run/scw-metadata.cache
+                      ln -s scw-metadata.cache /run/oc-metadata.cache 2>/dev/null
+                      break
+                  fi
+                  sleep 2
+              done
+          fi
+      fi
+
+      if [ "$#" -ne 1 ]; then
+          echo "$BODY"
+      else
+          key="$1"
+          echo "$BODY" | grep "^$key=" | sed "s/^[^=]*=//;s/^['\"]//;s/['\"]$//"
+      fi
+  - path: /usr/local/sbin/scw-userdata
+    permissions: 0755
+    owner: root:root
+    content: |
+      #!/bin/sh
+      # description "executable which retrieves server userdata (TEXT)"
+      # author "Scaleway <opensource@scaleway.com>"
+
+      export PATH="${PATH:+$PATH:}/usr/bin:/bin"
+
+      USERDATA_IP=${USERDATA_IP:-169.254.42.42}
+      USERDATA_URL=${USERDATA_URL:-"http://${USERDATA_IP}/user_data"}
+
+      get() {
+          URL=$1
+          if type curl >/dev/null 2>/dev/null; then
+              # Using curl
+              RESPONSE=$(curl --local-port 1-1024 --noproxy '*' --silent --write-out "\n%{http_CODE}\n" $URL)
+              CODE=$(echo "$RESPONSE" | sed -n '$p')
+              BODY=$(echo "$RESPONSE" | sed '$d')
+              echo "$BODY"
+          else
+              echo "'curl' dependency is missing." >&2
+          fi
+      }
+
+      patch() {
+          URL="$1"
+          DATA="$2"
+          if type curl >/dev/null 2>/dev/null; then
+              # Using curl
+              RESPONSE=$(curl --local-port 1-1024 --noproxy '*' -X PATCH -d "$DATA" -H "Content-Type: text/plain" --silent --write-out "\n%{http_CODE}\n" $URL)
+          else
+              echo "'curl' dependency is missing." >&2
+          fi
+      }
+
+      if [ "$1" = "" ]; then
+          get "$USERDATA_URL/"
+      else
+          if [ "$2" = "" ]; then
+              get "$USERDATA_URL/$1"
+          else
+              patch "$USERDATA_URL/$1" "$2"
+          fi
+      fi
+  - path: /usr/local/sbin/scw-fetch-ssh-keys
+    permissions: 0755
+    owner: root:root
+    content: |
+      #!/bin/sh
+      # description "fetch SSH keys"
+      # author "Scaleway <opensource@scaleway.com>"
+      # source "https://github.com/scaleway/image-tools/blob/master/skeleton-common/usr/local/sbin/scw-fetch-ssh-keys"
+
+      set -e
+
+      # ensure /root/.ssh exists and has correct permissions
+      mkdir -p /root/.ssh
+      chmod 700 /root/.ssh
+
+      # `--upgrade` refreshes the metadata cache
+      if [ "$1" = "--upgrade" ]; then
+      	/usr/local/bin/scw-metadata > /dev/null
+      fi
+
+      cat << EOF > /root/.ssh/authorized_keys
+      #
+      # WARNING: Automatically generated file
+      # This file will be erased at every boot
+      # This file was generated with '/usr/local/sbin/scw-fetch-ssh-keys'
+      #
+      # To add a new key, you can:
+      #   -- Add keys on your Scaleway account https://cloud.scaleway.com/#/credentials
+      #   -- Add keys using server tags - https://cloud.scaleway.com/#/servers/$(scw-metadata --cached ID)
+      #        - i.e: "AUTHORIZED_KEY=ssh-rsa_XXXXXXXXXXX AUTHORIZED_KEY=ssh-rsa_YYYYYYYYYYYYYYY"
+      #        - Be sure to replace all spaces with underscores
+      #        - $> sed 's/ /_/g' ~./ssh/id_rsa.pub
+      #   -- Add the keys to '/root/.ssh/instance_keys' which will be imported
+      #
+      # And recreate your 'authorized_keys' file with the new keys:
+      #   -- Run 'scw-fetch-ssh-keys --upgrade'
+      #
+      EOF
+
+      # add Scaleway account keys
+      /usr/local/bin/scw-metadata --cached | grep SSH_PUBLIC_KEYS_.*_KEY | cut -d'=' -f 2- | tr -d \' >> /root/.ssh/authorized_keys
+
+      # add Server tags keys
+      /usr/local/bin/scw-metadata --cached | grep TAGS_.*=AUTHORIZED_KEY | cut -d'=' -f 3- | sed 's/_/\ /g' >> /root/.ssh/authorized_keys
+
+      # Import custom keys
+      if [ -f /root/.ssh/instance_keys ]; then
+      	cat << EOF >> /root/.ssh/authorized_keys
+      # Below your custom ssh keys from '/root/.ssh/instance_keys'
+      EOF
+      	(cat /root/.ssh/instance_keys | grep -v "^#" || true) >> /root/.ssh/authorized_keys
+      fi
