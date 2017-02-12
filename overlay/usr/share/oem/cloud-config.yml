@@ -68,8 +68,8 @@ coreos:
 
         [Service]
         Type=oneshot
-        Environment=PATH=/opt/sbin:/opt/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        ExecStart=/usr/bin/bash -c "/usr/local/bin/scw-fetch-ssh-keys"
+        Environment=PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        ExecStart=/usr/bin/bash -c "/usr/local/sbin/scw-fetch-ssh-keys"
 
         [Install]
         WantedBy=multi-user.target
